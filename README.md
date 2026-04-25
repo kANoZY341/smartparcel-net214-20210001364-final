@@ -27,19 +27,18 @@ It demonstrates a scalable, event-driven architecture using fully managed AWS se
 ---
 
 ## ⚙️ System Architecture
-Client (Postman / CloudShell)
-↓
-API Gateway (REST API)
-↓
-Lambda API (Business Logic)
-↓
-DynamoDB (Parcel Storage)
-↓
-SQS (Event Queue)
-↓
-Lambda Notifier
-↓
-SNS (Email Notification)
+
+- **Client** (Postman / CloudShell)
+  ↓
+- **API Gateway** (REST API)
+  ↓
+- **Lambda API** (Business Logic)
+  - Stores data in **DynamoDB**
+  - Sends events to **SQS**
+    ↓
+- **Lambda Notifier**
+  ↓
+- **SNS** (Email Notification)
 
 ---
 
