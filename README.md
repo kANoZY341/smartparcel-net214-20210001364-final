@@ -30,3 +30,4 @@ AWS Region: ap-southeast-2
 
 API Gateway and Lambda tested successfully.
 SQS to SNS notification pipeline verified.
+CloudWatch, CloudTrail, and VPC screenshots included in report.
