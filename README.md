@@ -28,3 +28,4 @@ AWS Region: ap-southeast-2
 - Dead Letter Queue for failed messages
 - Load test with 20 concurrent requests
 
+API Gateway and Lambda tested successfully.
