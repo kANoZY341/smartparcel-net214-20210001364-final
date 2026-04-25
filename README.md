@@ -29,3 +29,4 @@ AWS Region: ap-southeast-2
 - Load test with 20 concurrent requests
 
 API Gateway and Lambda tested successfully.
+SQS to SNS notification pipeline verified.
