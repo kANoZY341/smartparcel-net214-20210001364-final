@@ -1,0 +1,663 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SmartParcel NET214 Serverless Project
+
+Parameters:
+  StudentId:
+    Type: String
+    Default: ahmad20210001364
+
+  NotificationEmail:
+    Type: String
+    Default: 20210001364@students.cud.ac.ae
+
+Resources:
+
+  ParcelsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub smartparcel-parcels-${StudentId}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: parcel_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: parcel_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  PhotosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub smartparcel-photos-${StudentId}
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-old-photos
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: 365
+
+  EventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub smartparcel-events-dlq-${StudentId}
+
+  EventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub smartparcel-events-${StudentId}
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventsDLQ.Arn
+        maxReceiveCount: 3
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub smartparcel-alerts-${StudentId}
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  ApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub smartparcel-api-role-${StudentId}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: smartparcel-api-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ParcelsTable.Arn
+                  - !Sub "${ParcelsTable.Arn}/index/status-index"
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt EventsQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub "${PhotosBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/smartparcel-api-${StudentId}:*"
+
+  NotifierLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub smartparcel-notifier-role-${StudentId}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: smartparcel-notifier-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt EventsQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertsTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/smartparcel-notifier-${StudentId}:*"
+
+  ApiLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub smartparcel-api-${StudentId}
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ApiLambdaRole.Arn
+      Timeout: 20
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ParcelsTable
+          QUEUE_URL: !Ref EventsQueue
+      Code:
+        ZipFile: |
+          import json, os, uuid
+          import boto3
+          from datetime import datetime, timezone
+
+          dynamodb = boto3.resource("dynamodb")
+          sqs = boto3.client("sqs")
+
+          TABLE_NAME = os.environ["TABLE_NAME"]
+          QUEUE_URL = os.environ["QUEUE_URL"]
+          table = dynamodb.Table(TABLE_NAME)
+
+          VALID_STATUSES = ["registered", "picked_up", "in_transit", "delivered"]
+
+          def response(code, body):
+              return {
+                  "statusCode": code,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps(body)
+              }
+
+          def parse_body(event):
+              body = event.get("body") or "{}"
+              if len(body.encode("utf-8")) > 10240:
+                  raise ValueError("Payload too large. Maximum allowed size is 10 KB.")
+              try:
+                  return json.loads(body)
+              except:
+                  raise ValueError("Invalid JSON body")
+
+          def role(event):
+              headers = event.get("headers") or {}
+              return headers.get("X-User-Role") or headers.get("x-user-role") or ""
+
+          def require_role(event, allowed):
+              user_role = role(event)
+              if user_role not in allowed:
+                  return False
+              return True
+
+          def require_fields(body, fields):
+              for field in fields:
+                  if field not in body or body[field] in ["", None]:
+                      raise ValueError(f"Missing field: {field}")
+
+          def lambda_handler(event, context):
+              try:
+                  method = event.get("httpMethod")
+                  path = event.get("resource")
+                  params = event.get("pathParameters") or {}
+
+                  if method == "POST" and path == "/parcels":
+                      if not require_role(event, ["driver", "admin"]):
+                          return response(403, {"error": "Forbidden"})
+                      return create_parcel(event)
+
+                  if method == "GET" and path == "/parcels/{id}":
+                      if not require_role(event, ["driver", "customer", "admin"]):
+                          return response(403, {"error": "Forbidden"})
+                      return get_parcel(params.get("id"))
+
+                  if method == "GET" and path == "/parcels":
+                      if not require_role(event, ["admin"]):
+                          return response(403, {"error": "Forbidden"})
+                      return list_parcels(event)
+
+                  if method == "PUT" and path == "/parcels/{id}/status":
+                      if not require_role(event, ["driver"]):
+                          return response(403, {"error": "Forbidden"})
+                      return update_status(event, params.get("id"))
+
+                  if method == "DELETE" and path == "/parcels/{id}":
+                      if not require_role(event, ["admin"]):
+                          return response(403, {"error": "Forbidden"})
+                      return delete_parcel(params.get("id"))
+
+                  return response(404, {"error": "Not found"})
+
+              except ValueError as e:
+                  return response(400, {"error": str(e)})
+              except Exception as e:
+                  print("ERROR:", str(e))
+                  return response(500, {"error": "Internal server error"})
+
+          def create_parcel(event):
+              body = parse_body(event)
+              require_fields(body, ["sender", "receiver", "address", "email"])
+
+              parcel_id = "PKG-" + datetime.now().strftime("%Y") + "-" + uuid.uuid4().hex[:8].upper()
+              now = datetime.now(timezone.utc).isoformat()
+
+              item = {
+                  "parcel_id": parcel_id,
+                  "sender": body["sender"],
+                  "receiver": body["receiver"],
+                  "address": body["address"],
+                  "customer_email": body["email"],
+                  "status": "registered",
+                  "created_at": now,
+                  "updated_at": now
+              }
+
+              table.put_item(Item=item)
+              return response(201, item)
+
+          def get_parcel(parcel_id):
+              result = table.get_item(Key={"parcel_id": parcel_id})
+              item = result.get("Item")
+              if not item:
+                  return response(404, {"error": "Parcel not found"})
+              return response(200, item)
+
+          def list_parcels(event):
+              query = event.get("queryStringParameters") or {}
+              status = query.get("status")
+
+              if status:
+                  if status not in VALID_STATUSES:
+                      return response(400, {"error": "Invalid status"})
+                  result = table.query(
+                      IndexName="status-index",
+                      KeyConditionExpression=boto3.dynamodb.conditions.Key("status").eq(status)
+                  )
+              else:
+                  result = table.scan()
+
+              return response(200, {"items": result.get("Items", [])})
+
+          def update_status(event, parcel_id):
+              body = parse_body(event)
+              require_fields(body, ["status"])
+
+              new_status = body["status"]
+              if new_status not in VALID_STATUSES:
+                  return response(400, {"error": "Invalid status"})
+
+              result = table.get_item(Key={"parcel_id": parcel_id})
+              item = result.get("Item")
+              if not item:
+                  return response(404, {"error": "Parcel not found"})
+
+              old_status = item["status"]
+              if VALID_STATUSES.index(new_status) <= VALID_STATUSES.index(old_status):
+                  return response(409, {"error": "Status can only move forward"})
+
+              now = datetime.now(timezone.utc).isoformat()
+
+              table.update_item(
+                  Key={"parcel_id": parcel_id},
+                  UpdateExpression="SET #s = :s, updated_at = :u",
+                  ExpressionAttributeNames={"#s": "status"},
+                  ExpressionAttributeValues={":s": new_status, ":u": now}
+              )
+
+              sqs.send_message(
+                  QueueUrl=QUEUE_URL,
+                  MessageBody=json.dumps({
+                      "parcel_id": parcel_id,
+                      "new_status": new_status,
+                      "customer_email": item["customer_email"],
+                      "timestamp": now
+                  })
+              )
+
+              item["status"] = new_status
+              item["updated_at"] = now
+              return response(200, item)
+
+          def delete_parcel(parcel_id):
+              result = table.get_item(Key={"parcel_id": parcel_id})
+              item = result.get("Item")
+              if not item:
+                  return response(404, {"error": "Parcel not found"})
+
+              if item["status"] != "registered":
+                  return response(409, {"error": "Only registered parcels can be cancelled"})
+
+              table.delete_item(Key={"parcel_id": parcel_id})
+              return response(200, {"message": "Parcel cancelled", "parcel_id": parcel_id})
+
+  NotifierLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub smartparcel-notifier-${StudentId}
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt NotifierLambdaRole.Arn
+      Timeout: 20
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref AlertsTopic
+      Code:
+        ZipFile: |
+          import json, os
+          import boto3
+
+          sns = boto3.client("sns")
+          TOPIC_ARN = os.environ["TOPIC_ARN"]
+
+          def lambda_handler(event, context):
+              for record in event.get("Records", []):
+                  try:
+                      body = json.loads(record["body"])
+                      parcel_id = body["parcel_id"]
+                      new_status = body["new_status"]
+                      customer_email = body.get("customer_email", "customer")
+
+                      message = f"SmartParcel update: Parcel {parcel_id} is now {new_status}. Customer: {customer_email}"
+
+                      sns.publish(
+                          TopicArn=TOPIC_ARN,
+                          Subject="SmartParcel Status Update",
+                          Message=message
+                      )
+
+                  except Exception as e:
+                      print("Malformed message skipped:", str(e))
+                      continue
+
+              return {"statusCode": 200}
+
+  SqsTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt EventsQueue.Arn
+      FunctionName: !Ref NotifierLambda
+      BatchSize: 10
+      Enabled: true
+
+  SmartParcelApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub SmartParcel-API-${StudentId}
+      Body:
+        swagger: "2.0"
+        info:
+          title: !Sub SmartParcel-API-${StudentId}
+          version: "1.0"
+        schemes:
+          - https
+        paths:
+          /parcels:
+            post:
+              security:
+                - api_key: []
+              x-amazon-apigateway-integration:
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations
+                httpMethod: POST
+                type: aws_proxy
+            get:
+              security:
+                - api_key: []
+              x-amazon-apigateway-integration:
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations
+                httpMethod: POST
+                type: aws_proxy
+          /parcels/{id}:
+            get:
+              parameters:
+                - name: id
+                  in: path
+                  required: true
+                  type: string
+              x-amazon-apigateway-integration:
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations
+                httpMethod: POST
+                type: aws_proxy
+            delete:
+              security:
+                - api_key: []
+              parameters:
+                - name: id
+                  in: path
+                  required: true
+                  type: string
+              x-amazon-apigateway-integration:
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations
+                httpMethod: POST
+                type: aws_proxy
+          /parcels/{id}/status:
+            put:
+              security:
+                - api_key: []
+              parameters:
+                - name: id
+                  in: path
+                  required: true
+                  type: string
+              x-amazon-apigateway-integration:
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiLambda.Arn}/invocations
+                httpMethod: POST
+                type: aws_proxy
+        securityDefinitions:
+          api_key:
+            type: apiKey
+            name: x-api-key
+            in: header
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SmartParcelApi
+    Properties:
+      RestApiId: !Ref SmartParcelApi
+      StageName: prod
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub smartparcel-api-key-${StudentId}
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiDeployment
+    Properties:
+      UsagePlanName: !Sub smartparcel-usage-plan-${StudentId}
+      ApiStages:
+        - ApiId: !Ref SmartParcelApi
+          Stage: prod
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SmartParcelApi}/*/*/*
+
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smartparcel-errors-${StudentId}
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiLambda
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  SmartParcelVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub smartparcel-vpc-${StudentId}
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SmartParcelVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Sub ${AWS::Region}a
+      Tags:
+        - Key: Name
+          Value: !Sub smartparcel-public-subnet-${StudentId}
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SmartParcelVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Sub ${AWS::Region}b
+      Tags:
+        - Key: Name
+          Value: !Sub smartparcel-private-subnet-${StudentId}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub smartparcel-igw-${StudentId}
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref SmartParcelVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SmartParcelVpc
+      Tags:
+        - Key: Name
+          Value: !Sub smartparcel-public-rt-${StudentId}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref SmartParcelVpc
+      Tags:
+        - Key: Name
+          Value: !Sub smartparcel-public-nacl-${StudentId}
+
+  NaclInboundHTTP:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 100
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 80
+        To: 80
+
+  NaclInboundHTTPS:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 110
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 443
+        To: 443
+
+  NaclOutboundAll:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+
+  PublicSubnetNaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      NetworkAclId: !Ref PublicNetworkAcl
+
+  DynamoDbVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref SmartParcelVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+
+Outputs:
+  ApiInvokeUrl:
+    Description: API Gateway invoke URL
+    Value: !Sub https://${SmartParcelApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+
+  ApiKeyId:
+    Description: API key ID
+    Value: !Ref ApiKey
+
+  SnsTopicArn:
+    Description: SNS topic ARN
+    Value: !Ref AlertsTopic
